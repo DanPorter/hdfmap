@@ -21,7 +21,7 @@ string = hdf.format('my data is {dataset_name_1:.2f}')
 
 # Shortcuts - multifile load data
 from hdfmap import hdf_data, hdf_eval, hdf_format, hdf_image
-all_data = hdf_data([f'file{n}.nxs' for n in range(100)], 'dataset_name')
+all_data = hdf_data([f"file{n}.nxs" for n in range(100)], 'dataset_name')
 normalised_data = hdf_eval(filenames, 'total / Transmission / (rc / 300.)')
 descriptions = hdf_eval(filenames, 'Energy: {en:5.3f} keV')
 image_stack = hdf_image(filenames, index=31)
@@ -40,8 +40,13 @@ from .file_functions import hdf_data, hdf_image, hdf_eval, hdf_format, nexus_dat
 from .reloader_class import HdfReloader
 
 
-__version__ = "0.3.0"
-__date__ = "2024/07/10"
+__all__ = [
+    HdfMap, NexusMap, list_files, load_hdf, create_hdf_map, create_nexus_map,
+    hdf_data, hdf_image, hdf_eval, hdf_format, nexus_data_block, HdfReloader
+]
+
+__version__ = "0.4.0"
+__date__ = "2024/07/11"
 
 
 def version_info() -> str:

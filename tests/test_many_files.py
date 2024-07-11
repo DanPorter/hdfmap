@@ -10,9 +10,9 @@ def check_nexus(*args, **kwargs):
     print(f"N scannables: {len(mymap.scannables)}")
     print(f"      length: {mymap.scannables_length()}")
     print('Addresses:')
-    print(f"scan_command: {mymap['scan_command']}")
-    print(f"        axes: {mymap['axes']}")
-    print(f"      signal: {mymap['signal']}")
+    print(f"scan_command: {mymap.get_address('scan_command')}")
+    print(f"        axes: {mymap.get_address('axes')}")
+    print(f"      signal: {mymap.get_address('signal')}")
     print(f"       image: {mymap.get_image_address()}")
     print('Data:')
     with hdfmap.load_hdf(mymap.filename) as hdf:
@@ -24,7 +24,7 @@ def check_nexus(*args, **kwargs):
         print(f"        axes: {axes.shape if axes is not None else None}")
         print(f"      signal: {signal.shape if signal is not None else None}")
         print(f"       image: {image.shape if image is not None else None}")
-    print(f"---")
+    print("---")
     return mymap
 
 

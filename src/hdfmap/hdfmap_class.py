@@ -37,11 +37,11 @@ def build_address(*args: str | bytes) -> str:
     return SEP + SEP.join((arg.decode() if isinstance(arg, bytes) else arg).strip(SEP) for arg in args)
 
 
-def _disp_dict(mydict: dict, indent: int = 10) -> str:
+def disp_dict(mydict: dict, indent: int = 10) -> str:
     return '\n'.join([f"{key:>{indent}}: {value}" for key, value in mydict.items()])
 
 
-class _DictObj(dict):
+class DictObj(dict):
     """
     Convert dict to class that looks like a class object with key names as attributes
         obj = DictObj({'item1': 'value1'}, 'docs')
@@ -146,8 +146,13 @@ class HdfMap:
         self._default_image_address = None
 
     def __getitem__(self, item):
-        # TODO: make this work correctly for __contains__, __getitem__ and __iter__
         return self.combined[item]
+
+    def __iter__(self):
+        return iter(self.combined)
+
+    def __contains__(self, item):
+        return item in self.combined or item in self.datasets
 
     def __repr__(self):
         return f"HdfMap based on '{self.filename}'"
@@ -156,22 +161,22 @@ class HdfMap:
         """Return str info on groups"""
         out = f"{repr(self)}\n"
         out += "Groups:\n"
-        out += _disp_dict(self.groups, 10)
+        out += disp_dict(self.groups, 10)
         out += '\n\nClasses:\n'
-        out += _disp_dict(self.classes, 10)
+        out += disp_dict(self.classes, 10)
         return out
 
     def info_datasets(self):
         """Return str info on datasets"""
         out = f"{repr(self)}\n"
         out += "Datasets:\n"
-        out += _disp_dict(self.datasets, 10)
+        out += disp_dict(self.datasets, 10)
         return out
 
     def info_dataset_types(self):
         """Return str info on dataset types"""
         out = "Values:\n"
-        out += _disp_dict(self.values, 10)
+        out += disp_dict(self.values, 10)
         out += "Arrays:\n"
         out += '\n'.join([
             f"{name:>10}: {str(self.datasets[address][2]):10} : {address:60}"
@@ -558,7 +563,7 @@ class HdfMap:
         ])
         return out
 
-    def get_data_block(self, hdf_file: h5py.File) -> _DictObj:
+    def get_data_block(self, hdf_file: h5py.File) -> DictObj:
         """
         Return data object
             data_object.scannable -> array
@@ -571,8 +576,8 @@ class HdfMap:
         doc = f"""DataObject for '{hdf_file.filename}'"""
         metadata = self.get_metadata(hdf_file)
         scannables = self.get_scannables(hdf_file)
-        scannables['metadata'] = _DictObj(metadata, docstr=doc)
-        return _DictObj(scannables, docstr=doc)
+        scannables['metadata'] = DictObj(metadata, docstr=doc)
+        return DictObj(scannables, docstr=doc)
 
     def eval(self, hdf_file: h5py.File, expression: str):
         """

@@ -31,9 +31,9 @@ def check_nexus(filename, description):
         'len_combined': len(mymap.combined),
         'len_scannables': len(mymap.scannables),
         'scannables_length': mymap.scannables_length(),
-        'scan_command': mymap['scan_command'],
-        'axes': mymap['axes'],
-        'signal': mymap['signal'],
+        'scan_command': mymap.get_address('scan_command'),
+        'axes': mymap.get_address('axes'),
+        'signal': mymap.get_address('signal'),
         'image': mymap.get_image_address()
     }
     return out

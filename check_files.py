@@ -8,7 +8,6 @@ import hdfmap
 def check_nexus(*args, **kwargs):
     mymap = hdfmap.create_nexus_map(*args, **kwargs)
     print(f"\n{repr(mymap)}")
-    print(f"")
     print(f"  N combined: {len(mymap.combined)}")
     print(f"N scannables: {len(mymap.scannables)}")
     print(f"      length: {mymap.scannables_length()}")
@@ -27,7 +26,7 @@ def check_nexus(*args, **kwargs):
         print(f"        axes: {axes.shape if axes is not None else None}")
         print(f"      signal: {signal.shape if signal is not None else None}")
         print(f"       image: {image.shape if image is not None else None}")
-    print(f"\n")
+    print("\n")
     return mymap
 
 
