@@ -4,9 +4,12 @@ Nexus Related functions and nexus class
 
 import h5py
 
-from .hdfmap_class import HdfMap, build_address
+from .logging import create_logger
+from .hdfmap_class import HdfMap, build_hdf_path, generate_identifier
 
-
+NX_CLASS = 'NX_class'
+NX_ENTRY = b'NXentry'
+NX_DATA = b'NXdata'
 NX_LOCALNAME = 'local_name'
 NX_DEFAULT = 'default'
 NX_MEASUREMENT = 'measurement'
@@ -15,52 +18,74 @@ NX_SIGNAL = 'signal'
 NX_AXES = 'axes'
 NX_DETECTOR = 'NXdetector'
 NX_DETECTOR_DATA = 'data'
+logger = create_logger(__name__)
+
+
+def check_nexus_class(hdf_group: h5py.Group, nxclass: bytes) -> bool:
+    """
+    Check if hdf_group is a certain NX_class
+    :param hdf_group:
+    :param nxclass:
+    :return:
+    """
+    return True if hdf_group and NX_CLASS in hdf_group.attrs and hdf_group.attrs[NX_CLASS] == nxclass else False
 
 
 def default_nxentry(hdf_file: h5py.File) -> str | bytes:
-    """Return the default nxentry address"""
-    return hdf_file.attrs[NX_DEFAULT] if NX_DEFAULT in hdf_file.attrs else next(iter(hdf_file))
+    """Return the default NXentry path, or the first NXentry if there is no default, errors if no NXentry"""
+    return entry if (
+            NX_DEFAULT in hdf_file.attrs and
+            isinstance(hdf_file.get(entry := hdf_file.attrs[NX_DEFAULT]), h5py.Group)
+    ) else next(path for path in hdf_file if check_nexus_class(hdf_file.get(path), NX_ENTRY))
 
 
-def get_nexus_axes_datasets(hdf_file: h5py.File) -> tuple[list[str], str]:
+def default_nxdata(entry_group: h5py.Group) -> str | bytes:
+    """Return the default NXdata path within an NXentry group"""
+    nx_data_name = entry_group.attrs[NX_DEFAULT] if NX_DEFAULT in entry_group.attrs else NX_MEASUREMENT
+    if nx_data_name not in entry_group:
+        nx_data_name = next(name for name in entry_group if check_nexus_class(entry_group.get(name), NX_DATA))
+    return nx_data_name
+
+
+def find_nexus_data(hdf_file: h5py.File) -> tuple[list[str], str]:
     """
     Nexus compliant method of finding default plotting axes in hdf files
      - find "default" entry group in top File group
-     - find "default" data group in entry
+     - find "default" data group in entry (or 'measurement', or first 'NXdata')
      - find "axes" attr in default data
      - find "signal" attr in default data
-     - generate addresses of signal and axes
+     - generate paths of signal and axes
      if not nexus compliant, raises KeyError
     This method is very fast but only works on nexus compliant files
     :param hdf_file: open HDF file object, i.e. h5py.File(...)
-    :return axes_addresses: list of str hdf addresses for axes datasets
-    :return signal_address: str hdf address for signal dataset
+    :return axes_paths: list of str hdf paths for axes datasets
+    :return signal_path: str hdf path for signal dataset
     """
     # From: https://manual.nexusformat.org/examples/python/plotting/index.html
     # find the default NXentry group
-    nx_entry_name = hdf_file.attrs[NX_DEFAULT] if NX_DEFAULT in hdf_file.attrs else next(iter(hdf_file.keys()))
+    nx_entry_name = default_nxentry(hdf_file)
     nx_entry = hdf_file[nx_entry_name]
     # find the default NXdata group
-    nx_data_name = nx_entry.attrs[NX_DEFAULT] if NX_DEFAULT in nx_entry.attrs else NX_MEASUREMENT
+    nx_data_name = default_nxdata(nx_entry)
     nx_data = nx_entry[nx_data_name]
     # find the axes field(s)
-    if isinstance(nx_data.attrs[NX_AXES], (str, bytes)):
-        axes_addresses = [build_address(nx_entry_name, nx_data_name, nx_data.attrs[NX_AXES])]
+    if isinstance(axes := nx_data.attrs[NX_AXES], (str, bytes)):
+        axes_paths = [build_hdf_path(nx_entry_name, nx_data_name, axes)]
     else:
-        axes_addresses = [build_address(nx_entry_name, nx_data_name, _axes) for _axes in nx_data.attrs[NX_AXES]]
+        axes_paths = [build_hdf_path(nx_entry_name, nx_data_name, _axes) for _axes in axes]
     # get the signal field
-    signal_address = build_address(nx_entry_name, nx_data_name, nx_data.attrs[NX_SIGNAL])
-    return axes_addresses, signal_address
+    signal_path = build_hdf_path(nx_entry_name, nx_data_name, nx_data.attrs[NX_SIGNAL])
+    return axes_paths, signal_path
 
 
-def get_strict_nexus_axes_datasets(hdf_file: h5py.File) -> tuple[list[h5py.Dataset], h5py.Dataset]:
+def find_nexus_data_strict(hdf_file: h5py.File) -> tuple[list[h5py.Dataset], h5py.Dataset]:
     """
     Nexus compliant method of finding default plotting axes in hdf files
      - find "default" entry group in top File group
      - find "default" data group in entry
      - find "axes" attr in default data
      - find "signal" attr in default data
-     - generate addresses of signal and axes
+     - generate paths of signal and axes
      if not nexus compliant, raises KeyError
     This method is very fast but only works on nexus compliant files
     :param hdf_file: open HDF file object, i.e. h5py.File(...)
@@ -95,23 +120,23 @@ class NexusMap(HdfMap):
         nxmap.populate(nxs, default_entry_only=True)  # populates only from the default entry
 
     # Special behaviour
-    nxmap['axes'] -> return address of default axes dataset
-    nxmap['signal'] -> return address of default signal dataset
+    nxmap['axes'] -> return path of default axes dataset
+    nxmap['signal'] -> return path of default signal dataset
     """
 
-    def _load_defaults(self, hdf_file):
+    def __repr__(self):
+        return f"NexusMap based on '{self.filename}'"
+
+    def _default_nexus_paths(self, hdf_file):
         """Load Nexus default axes and signal"""
-        super()._load_defaults(hdf_file)
         try:
-            axes_addresses, signal_address = get_nexus_axes_datasets(hdf_file)
-            if axes_addresses and axes_addresses[0] in hdf_file:
-                self.arrays[NX_AXES] = axes_addresses[0]
-                if self._debug:
-                    self._debug_logger(f"DEFAULT axes: {axes_addresses}")
-            if signal_address in hdf_file:
-                self.arrays[NX_SIGNAL] = signal_address
-                if self._debug:
-                    self._debug_logger(f"DEFAULT signal: {signal_address}")
+            axes_paths, signal_path = find_nexus_data(hdf_file)
+            if axes_paths and axes_paths[0] in hdf_file:
+                self.arrays[NX_AXES] = axes_paths[0]
+                logger.info(f"DEFAULT axes: {axes_paths}")
+            if signal_path in hdf_file:
+                self.arrays[NX_SIGNAL] = signal_path
+                logger.info(f"DEFAULT signal: {signal_path}")
         except KeyError:
             pass
 
@@ -119,35 +144,34 @@ class NexusMap(HdfMap):
         """Generate scannables from scan_field names or default NXdata"""
         # find 'scan_fields' to generate scannables list
         if NX_SCANFIELDS in self.arrays:
-            scan_fields_address = self.arrays[NX_SCANFIELDS]
-            scan_fields = hdf_file[scan_fields_address][()]
-            if self._debug:
-                self._debug_logger(f"NX ScanFields: {scan_fields_address}: {scan_fields}")
+            scan_fields_path = self.arrays[NX_SCANFIELDS]
+            scan_fields = hdf_file[scan_fields_path][()]
+            logger.info(f"NX ScanFields: {scan_fields_path}: {scan_fields}")
             self.generate_scannables_from_names(scan_fields)
         else:
             # find the default NXdata group and generate the scannables list
             nx_entry = hdf_file.get(default_nxentry(hdf_file))
-            nx_data = nx_entry.get(nx_entry.attrs[NX_DEFAULT] if NX_DEFAULT in nx_entry.attrs else NX_MEASUREMENT)
+            nx_data = nx_entry.get(default_nxdata(nx_entry))
+            logger.info(f"{nx_entry}, {nx_data}")
             if nx_data:
-                if self._debug:
-                    self._debug_logger(f"NX Data: {nx_data.name}")
+                logger.info(f"NX Data: {nx_data.name}")
                 self.generate_scannables_from_group(nx_data)
 
-        if self._debug and not self.scannables:
-            self._debug_logger("!!!Warning: No NXdata found, scannables not populated!")
+        if not self.scannables:
+            logger.warning("No NXdata found, scannables not populated!")
 
     def _image_data_from_nxdetector(self):
         """find the NXdetector group and assign the image data"""
         self.image_data = {}
         if NX_DETECTOR in self.classes:
-            for group_address in self.classes[NX_DETECTOR]:
-                detector_name = group_address.split('/')[-1]
-                data_address = build_address(group_address, NX_DETECTOR_DATA)
-                if data_address in self.datasets and len(self.get_shape(data_address)) > 1:
-                    self.image_data[detector_name] = data_address
+            for group_path in self.classes[NX_DETECTOR]:
+                detector_name = generate_identifier(group_path)
+                data_path = build_hdf_path(group_path, NX_DETECTOR_DATA)
+                if data_path in self.datasets and len(self.datasets[data_path].shape) > 1:
+                    self.image_data[detector_name] = data_path
 
-        if self._debug and not self.image_data:
-            self._debug_logger("!!!Warning: No NXdetector found, image_data not populated!")
+        if not self.image_data:
+            logger.warning("!!!Warning: No NXdetector found, image_data not populated!")
 
     def populate(self, hdf_file: h5py.File, groups=None, default_entry_only=False):
         """
@@ -160,67 +184,31 @@ class NexusMap(HdfMap):
         self.filename = hdf_file.filename
 
         # Add defaults to arrays
-        self._load_defaults(hdf_file)
+        self._default_nexus_paths(hdf_file)
 
         if default_entry_only:
             entries = [default_nxentry(hdf_file)]
         else:
-            entries = hdf_file.keys()
+            entries = [entry for entry in hdf_file if check_nexus_class(hdf_file.get(entry), NX_ENTRY)]
 
         for entry in entries:
             # find default or first entry
             nx_entry = hdf_file.get(entry)
             if nx_entry is None:
-                if self._debug:
-                    self._debug_logger(f"NX Entry {entry} doesn't exist - may be a missing link.")
-                    self._debug_logger(f"Missing link: {hdf_file.get(entry, getlink=True)}")
+                logger.warning(
+                    f"NX Entry {entry} doesn't exist - may be a missing link.\n" +
+                    f"Missing link: {hdf_file.get(entry, getlink=True)}"
+                )
                 continue  # group may be missing due to a broken link
-            address = build_address(entry)
-            if self._debug:
-                self._debug_logger(f"NX Entry: {address}")
-            self._store_group(nx_entry, address, entry)
-            self._populate(nx_entry, top_address=address, groups=groups)  # nx_entry.name can be wrong!
+            hdf_path = build_hdf_path(entry)
+            logger.debug(f"NX Entry: {hdf_path}")
+            self._store_group(nx_entry, hdf_path, entry)
+            self._populate(nx_entry, root=hdf_path, groups=groups)  # nx_entry.name can be wrong!
 
-            # find 'scan_fields' to generate scannables list
-            if NX_SCANFIELDS in self.arrays:
-                scan_fields_address = self.arrays[NX_SCANFIELDS]
-                scan_fields = hdf_file[scan_fields_address][()]
-                if self._debug:
-                    self._debug_logger(f"NX ScanFields: {scan_fields_address}: {scan_fields}")
-                self.generate_scannables_from_names(scan_fields)
-            else:
-                # find the default NXdata group and generate the scannables list
-                nx_data = nx_entry.get(nx_entry.attrs[NX_DEFAULT] if NX_DEFAULT in nx_entry.attrs else NX_MEASUREMENT)
-                if nx_data:
-                    if self._debug:
-                        self._debug_logger(f"NX Data: {nx_data.name}")
-                    self.generate_scannables_from_group(nx_data)
+        if not self.datasets:
+            logger.warning("!!!Warning: No datasets found!")
 
-        if self._debug and not self.scannables:
-            self._debug_logger("!!!Warning: No NXdata found, scannables not populated!")
-        if self._debug and not self.datasets:
-            self._debug_logger("!!!Warning: No datasets found!")
-
-        # TODO: replace per-entry generation of scannables with single generation from the default nxdata or scan_fields
-        # self._scannables_from_scan_fields_or_nxdata(hdf_file)
+        self._scannables_from_scan_fields_or_nxdata(hdf_file)
 
         # find the NXdetector group and assign the image data
-        # TODO: clean this up so so image data only gives {'detector_name': address}
-        # self._image_data_from_nxdetector()
-        if NX_DETECTOR in self.classes:
-            for class_address in self.classes[NX_DETECTOR]:
-                dataset_address = build_address(class_address, NX_DETECTOR_DATA)
-                if self._debug:
-                    self._debug_logger(f"NX Detector: {dataset_address} : {hdf_file.get(dataset_address)}")
-                if dataset_address in hdf_file and hdf_file[dataset_address].ndim > 1:
-                    if NX_DETECTOR not in self.image_data:
-                        self.image_data[NX_DETECTOR] = dataset_address  # first NXdetector
-                    self.image_data['_'.join(dataset_address.split('/')[-2:])] = dataset_address  # e.g. pil3_100k_data
-
-    def get_image_address(self) -> str:
-        """Return address of first dataset named 'data'"""
-        if self._default_image_address:
-            return self._default_image_address
-        # TODO: replace this with fist image_data field
-        if NX_DETECTOR in self.image_data:
-            return self.image_data[NX_DETECTOR]
+        self._image_data_from_nxdetector()

@@ -2,11 +2,13 @@
 hdfmap class definition
 """
 import typing
+from collections import defaultdict
 
 import numpy as np
 import h5py
 
-from .eval_functions import extra_hdf_data, eval_hdf, format_hdf
+from .logging import create_logger
+from .eval_functions import expression_safe_name, extra_hdf_data, eval_hdf, format_hdf, dataset2data
 
 try:
     import hdf5plugin  # required for compressed data
@@ -14,37 +16,73 @@ except ImportError:
     print('Warning: hdf5plugin not available.')
 
 # parameters
-SEP = '/'  # HDF address separator
+SEP = '/'  # HDF path separator
+LOCAL_NAME = 'local_name'  # dataset attribute name for alt_name
+VALUE = 'value'  # omit this name in paths when determining identifier
+# logger
+logger = create_logger(__name__)
 
 
-def address2name(address: str | bytes) -> str:
-    """Convert hdf address to name"""
-    if hasattr(address, 'decode'):  # Byte string
-        address = address.decode('ascii')
-    address = address.replace('.', '_')  # remove dots as cant be evaluated
-    # address = address.split('.')[-1]  # alternative to replacing dots
-    name = address.split(SEP)[-1]
-    return address.split(SEP)[-1] if name == 'value' else name
+class Group(typing.NamedTuple):
+    nx_class: str
+    name: str
+    attrs: dict
+    datasets: list[str]
 
 
-def build_address(*args: str | bytes) -> str:
+class Dataset(typing.NamedTuple):
+    name: str
+    size: int
+    shape: tuple[int]
+    attrs: dict
+
+
+def generate_identifier(hdf_path: str | bytes) -> str:
     """
-    Build address from string or bytes arguments
-        '/entry/measurement' = build_address(b'entry', 'measurement')
+    Generate a valid python identifier from a hdf dataset path or other string
+     - Decodes to ascii
+     - omits '/value'
+     - splits by path separator (/) and takes final element
+     - converts special characters to '_'
+     - removes replication of strings separated by '_'
+    E.G.
+        /entry/group/motor1 >> "motor1"
+        /entry/group/motor/value >> "motor"
+        /entry/group/subgroup.motor >> "subgroup_motor"
+        motor.motor >> "motor"
+    :param hdf_path: str hdf path address
+    :return: str expression safe name
+    """
+    if hasattr(hdf_path, 'decode'):  # Byte string
+        hdf_path = hdf_path.decode('ascii')
+    omit = f"/{VALUE}"
+    if hdf_path.endswith(omit):
+        hdf_path = hdf_path[:-len(omit)]  # omit 'value'
+    substrings = hdf_path.split(SEP)
+    name = expression_safe_name(substrings[-1])
+    # remove replication (handles local_names 'name.name' convention)
+    return '_'.join(dict.fromkeys(name.split('_')))
+
+
+def build_hdf_path(*args: str | bytes) -> str:
+    """
+    Build path from string or bytes arguments
+        '/entry/measurement' = build_hdf_path(b'entry', 'measurement')
     :param args: str or bytes arguments
-    :return: str address
+    :return: str hdf path
     """
     return SEP + SEP.join((arg.decode() if isinstance(arg, bytes) else arg).strip(SEP) for arg in args)
 
 
-def _disp_dict(mydict: dict, indent: int = 10) -> str:
+def disp_dict(mydict: dict, indent: int = 10) -> str:
     return '\n'.join([f"{key:>{indent}}: {value}" for key, value in mydict.items()])
 
 
-class _DictObj(dict):
+class DataHolder(dict):
     """
     Convert dict to class that looks like a class object with key names as attributes
-        obj = DictObj({'item1': 'value1'}, 'docs')
+    Replicates slightly the old scisoftpy.dictutils.DataHolder class, also known as DLS dat format.
+        obj = DataHolder({'item1': 'value1'}, 'docs')
         obj['item1'] -> 'value1'
         obj.item1 -> 'value1'
         help(obj) -> 'docs'
@@ -60,17 +98,21 @@ class _DictObj(dict):
         if docstr:
             self.__doc__ = docstr
 
+    def __repr__(self):
+        return "DataHolder({})"
+
+    def __str__(self):
+        return f"DataHolder({{\n{disp_dict(self)}\n}})"
+
 
 class HdfMap:
     """
-    HdfMap object, container for addresses of different objects in an HDF file
-        map = HdfMap()
-        with h5py.File('file.hdf') as hdf:
-            map.populate(hdf)
-        size = map.most_common_size()
-        map.generate_scannables(size)
+    HdfMap object, container for paths of different objects in an HDF file
 
-        map.get_address('data') -> '/entry/measurement/data'
+        with h5py.File('file.hdf') as hdf:
+            map = HdfMap(hdf)
+
+        map.get_path('data') -> '/entry/measurement/data'
         map['data'] -> '/entry/measurement/data'
 
         with h5py.File('another_file.hdf') as hdf:
@@ -81,25 +123,30 @@ class HdfMap:
             outstr = map.format(hdf, 'the data looks like: {data}')
 
     Objects within the HDF file are separated into Groups and Datasets. Each object has a
-    defined 'address' and 'name' paramater, as well as other attributes
-        address -> '/entry/measurement/data' -> the location of an object within the file
-        name -> 'data' -> an address expressed as a simple variable name
-    Address are unique location within the file but can be used to identify similar objects in other files
-    Names may not be unique within a file and are generated from the address.
+    defined 'path' and 'name' paramater, as well as other attributes
+        path -> '/entry/measurement/data' -> the location of an object within the file
+        name -> 'data' -> an path expressed as a simple variable name
+    Paths are unique location within the file but can be used to identify similar objects in other files
+    Names may not be unique within a file and are generated from the final element of the hdf path.
+     - When multiple paths produce the same name, the name is overwritten each time, so the last path in the
+    file has priority.
+     - Names are also stored using the 'local_name' attribute, if it exists
 
     Names of different types of datasets are stored for arrays (size > 0) and values (size 0)
     Names for scannables relate to all arrays of a particular size
     A combined list of names is provided where scannables > arrays > values
 
+
+
     Attributes:
-        map.groups      stores attributes of each group by address
-        map.classes     stores list of group addresses by nx_class
-        map.datasets    stores attributes of each dataset by address
-        map.arrays      stores array dataset addresses by name
-        map.values      stores value dataset addresses by name
-        map.scannables  stores array dataset addresses with given size, by name
-        map.combined    stores array and value addresses (arrays overwrite values)
-        map.image_data  stores dataset addresses of image data
+        map.groups      stores attributes of each group by path
+        map.classes     stores list of group paths by nx_class
+        map.datasets    stores attributes of each dataset by path
+        map.arrays      stores array dataset paths by name
+        map.values      stores value dataset paths by name
+        map.scannables  stores array dataset paths with given size, by name
+        map.combined    stores array and value paths (arrays overwrite values)
+        map.image_data  stores dataset paths of image data
     E.G.
         map.groups = {'/hdf/group': ('class', 'name', {attrs}, [datasets])}
         map.classes = {'class_name': ['/hdf/group1', '/hdf/group2']}
@@ -113,13 +160,13 @@ class HdfMap:
         map.populate(h5py.File) -> populates the dictionaries using the  given file
         map.generate_scannables(array_size) -> populates scannables namespace with arrays of same size
         map.most_common_size -> returns the most common dataset size > 1
-        map.get_size('name_or_address') -> return dataset size
-        map.get_shape('name_or_address') -> return dataset size
-        map.get_attr('name_or_address', 'attr') -> return value of dataset attribute
-        map.get_address('name_or_group_or_class') -> returns address of object with name
-        map.get_image_address() -> returns default address of detector dataset (or largest dataset)
-        map.get_group_address('name_or_address_or_class') -> return address of group with class
-        map.get_group_datasets('name_or_address_or_class') -> return list of dataset addresses in class
+        map.get_size('name_or_path') -> return dataset size
+        map.get_shape('name_or_path') -> return dataset size
+        map.get_attr('name_or_path', 'attr') -> return value of dataset attribute
+        map.get_path('name_or_group_or_class') -> returns path of object with name
+        map.get_image_path() -> returns default path of detector dataset (or largest dataset)
+        map.get_group_path('name_or_path_or_class') -> return path of group with class
+        map.get_group_datasets('name_or_path_or_class') -> return list of dataset pathes in class
     File Methods:
         map.get_metadata(h5py.File) -> returns dict of value datasets
         map.get_scannables(h5py.File) -> returns dict of scannable datasets
@@ -130,57 +177,66 @@ class HdfMap:
         map.eval(h5py.File, 'expression') -> returns output of expression
         map.format(h5py.File, 'string {name}') -> returns output of str expression
     """
-    _debug_logger = print
 
-    def __init__(self):
-        self._debug = False
+    def __init__(self, file: h5py.File | None = None):
         self.filename = ''
-        self.groups = {}  # stores attributes of each group by address
-        self.classes = {}  # stores group addresses by nx_class
-        self.datasets = {}  # stores attributes of each dataset by address
-        self.arrays = {}  # stores array dataset addresses by name
-        self.values = {}  # stores value dataset addresses by name
-        self.scannables = {}  # stores array dataset addresses with given size, by name
-        self.combined = {}  # stores array and value addresses (arrays overwrite values)
-        self.image_data = {}  # stores dataset addresses of image data
-        self._default_image_address = None
+        self.groups = {}  # stores attributes of each group by path
+        self.datasets = {}  # stores attributes of each dataset by path
+        self.classes = defaultdict(lambda: [])  # stores lists of group paths by nx_class
+        self.arrays = {}  # stores array dataset paths by name
+        self.values = {}  # stores value dataset paths by name
+        self.scannables = {}  # stores array dataset paths with given size, by name
+        self.combined = {}  # stores array and value paths (arrays overwrite values)
+        self.image_data = {}  # stores dataset paths of image data
+        self._default_image_path = None
+
+        if isinstance(file, h5py.File):
+            self.populate(file)
 
     def __getitem__(self, item):
-        # TODO: make this work correctly for __contains__, __getitem__ and __iter__
         return self.combined[item]
+
+    def __iter__(self):
+        return iter(self.combined)
+
+    def __contains__(self, item):
+        return item in self.combined or item in self.datasets
 
     def __repr__(self):
         return f"HdfMap based on '{self.filename}'"
+
+    def __str__(self):
+        return f"{repr(self)}\n{self.info_names()}\n{self.info_scannables()}"
 
     def info_groups(self):
         """Return str info on groups"""
         out = f"{repr(self)}\n"
         out += "Groups:\n"
-        out += _disp_dict(self.groups, 10)
+        out += disp_dict(self.groups, 10)
         out += '\n\nClasses:\n'
-        out += _disp_dict(self.classes, 10)
+        out += disp_dict(self.classes, 10)
         return out
 
     def info_datasets(self):
         """Return str info on datasets"""
         out = f"{repr(self)}\n"
         out += "Datasets:\n"
-        out += _disp_dict(self.datasets, 10)
+        out += disp_dict(self.datasets, 10)
         return out
 
     def info_dataset_types(self):
         """Return str info on dataset types"""
         out = "Values:\n"
-        out += _disp_dict(self.values, 10)
+        out += disp_dict(self.values, 10)
         out += "Arrays:\n"
         out += '\n'.join([
-            f"{name:>10}: {str(self.datasets[address][2]):10} : {address:60}"
-            for name, address in self.arrays.items()
+            f"{name:>30}: {str(self.datasets[path].shape):10} : {path:60}"
+            for name, path in self.arrays.items()
         ])
         out += "Images:\n"
         out += '\n'.join([
-            f"{name:>10}: {str(self.datasets[address][2]):10} : {address:60}"
-            for name, address in self.image_data.items()
+            f"{name:>30}: {str(self.datasets[path].shape):10} : {path:60}"
+            for name, path in self.image_data.items()
         ])
         return out
 
@@ -188,8 +244,8 @@ class HdfMap:
         """Return str info on combined namespace"""
         out = "Combined Namespace:\n"
         out += '\n'.join([
-            f"{name:>10}: {str(self.datasets[address][2]):10} : {address:60}"
-            for name, address in self.combined.items()
+            f"{name:>30}: {str(self.datasets[path].shape):10} : {path:60}"
+            for name, path in self.combined.items()
         ])
         return out
 
@@ -197,335 +253,308 @@ class HdfMap:
         """Return str info on scannables namespace"""
         out = "Scannables Namespace:\n"
         out += '\n'.join([
-            f"{name:>10}: {str(self.datasets[address][2]):10} : {address:60}"
-            for name, address in self.scannables.items()
+            f"{name:>30}: {str(self.datasets[path].shape):10} : {path:60}"
+            for name, path in self.scannables.items()
         ])
         return out
 
-    def __str__(self):
-        return f"{repr(self)}\n{self.info_names()}\n"
+    def _store_group(self, hdf_group: h5py.Group, path: str, name: str):
 
-    def debug(self, state=True, logger_function=None):
-        """Turn debugging on"""
-        self._debug = state
-        if logger_function:
-            self._debug_logger = logger_function
-
-    def _load_defaults(self, hdf_file: h5py.File):
-        """Overloaded method, called before _populate"""
-
-    def _store_group(self, hdf_group: h5py.Group, address: str, name: str):
-        try:
-            nx_class = hdf_group.attrs['NX_class'].decode() if 'NX_class' in hdf_group.attrs else 'Group'
-        except AttributeError:
-            nx_class = hdf_group.attrs['NX_class']
-        except OSError:
-            nx_class = 'NoClass'  # if object doesn't have attrs
-        # TODO: replace groups tuple with Group class
-        self.groups[address] = (
+        nx_class = hdf_group.attrs.get('NX_class', 'Group')
+        if hasattr(nx_class, 'decode'):
+            nx_class = nx_class.decode()
+        self.groups[path] = Group(
             nx_class,
             name,
             dict(hdf_group.attrs),
-            [key for key in hdf_group.keys() if isinstance(hdf_group.get(key), h5py.Dataset)]
+            [key for key, item in hdf_group.items() if isinstance(item, h5py.Dataset)]
         )
-        if name not in self.classes:
-            self.classes[name] = [address]
-        else:
-            self.classes[name].append(address)
-        if nx_class not in self.classes:
-            self.classes[nx_class] = [address]
-        else:
-            self.classes[nx_class].append(address)
-        if self._debug:
-            self._debug_logger(f"{address}  HDFGroup: {nx_class}")
+        self.classes[name].append(path)
+        self.classes[nx_class].append(path)
+        logger.debug(f"{path}  HDFGroup: {nx_class}")
         return nx_class
 
-    def _store_dataset(self, hdf_dataset: h5py.Dataset, address: str, name: str, altname: str):
-        # TODO: replace datasets tuple with Dataset class
-        self.datasets[address] = (name, hdf_dataset.size, hdf_dataset.shape, dict(hdf_dataset.attrs))
+    def _store_dataset(self, hdf_dataset: h5py.Dataset, hdf_path: str, name: str):
+        alt_name = generate_identifier(hdf_dataset.attrs[LOCAL_NAME]) if LOCAL_NAME in hdf_dataset.attrs else None
+        self.datasets[hdf_path] = Dataset(name, hdf_dataset.size, hdf_dataset.shape, dict(hdf_dataset.attrs))
         if hdf_dataset.ndim >= 3:
-            det_name = f"{address.split(SEP)[-2]}_{name}"
-            self.image_data[name] = address
-            self.image_data[det_name] = address
-            self.arrays[name] = address
-            self.arrays[altname] = address
-            if self._debug:
-                self._debug_logger(
-                    f"{address}  HDFDataset: image_data & array {name, hdf_dataset.size, hdf_dataset.shape}"
-                )
+            det_name = f"{hdf_path.split(SEP)[-2]}_{name}"
+            self.image_data[name] = hdf_path
+            self.image_data[det_name] = hdf_path
+            self.arrays[name] = hdf_path
+            if alt_name:
+                self.arrays[alt_name] = hdf_path
+            logger.debug(f"{hdf_path}  HDFDataset: image_data & array {name, hdf_dataset.size, hdf_dataset.shape}")
         elif hdf_dataset.ndim > 0:
-            self.arrays[name] = address
-            self.arrays[altname] = address
-            if self._debug:
-                self._debug_logger(f"{address}  HDFDataset: array {name, hdf_dataset.size, hdf_dataset.shape}")
+            self.arrays[name] = hdf_path
+            if alt_name:
+                self.arrays[alt_name] = hdf_path
+            logger.debug(f"{hdf_path}  HDFDataset: array {name, hdf_dataset.size, hdf_dataset.shape}")
         else:
-            self.values[name] = address
-            self.values[altname] = address
-            if self._debug:
-                self._debug_logger(f"{address}  HDFDataset: value")
+            self.values[name] = hdf_path
+            if alt_name:
+                self.values[alt_name] = hdf_path
+            logger.debug(f"{hdf_path}  HDFDataset: value")
 
-    def _populate(self, hdf_group: h5py.Group, top_address: str = '',
+    def _populate(self, hdf_group: h5py.Group, root: str = '',
                   recursive: bool = True, groups: list[str] = None):
         """
         populate HdfMap dictionary's using recursive method
         :param hdf_group: HDF group object, from HDF File
-        :param top_address: str address of hdf Group, used to build dataset addresses
+        :param root: str path of hdf Group, used to build dataset paths
         :param recursive: if True, will recursively search through subgroups
         :param groups: if not None, will only search subgroups named in list, e.g. ['entry','NX_DATA']
         :return: None
         """
+        logger.info(f"{repr(self)}._populate root='{root}'")
         for key in hdf_group:
             obj = hdf_group.get(key)
             link = hdf_group.get(key, getlink=True)
-            if self._debug:
-                self._debug_logger(f"{key}: {repr(obj)} : {repr(link)}")
+            logger.debug(f"{key}: {repr(obj)} : {repr(link)}")
             if obj is None:
                 continue  # dataset may be missing due to a broken link
-            address = top_address + SEP + key  # build hdf address - a cross-file unique identifier
-            name = address2name(address)
-            altname = address2name(obj.attrs['local_name']) if 'local_name' in obj.attrs else name
-            if self._debug:
-                self._debug_logger(f"{address}  {name}, altname={altname}, link={repr(link)}")
+            hdf_path = root + SEP + key  # build hdf path - a cross-file unique identifier
+            name = generate_identifier(hdf_path)
+            logger.info(f"{hdf_path}:  {name}, link={repr(link)}")
 
             # Group
             if isinstance(obj, h5py.Group):
-                nx_class = self._store_group(obj, address, name)
+                nx_class = self._store_group(obj, hdf_path, name)
                 if recursive and (key in groups or nx_class in groups if groups else True):
-                    self._populate(obj, address, recursive)
+                    self._populate(obj, hdf_path, recursive)
 
             # Dataset
             elif isinstance(obj, h5py.Dataset) and not isinstance(link, h5py.SoftLink):
-                self._store_dataset(obj, address, name, altname)
+                self._store_dataset(obj, hdf_path, name)
 
     def populate(self, hdf_file: h5py.File):
         """Populate all datasets from file"""
         self.filename = hdf_file.filename
-        self._load_defaults(hdf_file)
         self._populate(hdf_file)
+        size = self.most_common_size()
+        self.generate_scannables(size)
 
     def generate_combined(self):
         self.combined = {**self.values, **self.arrays, **self.scannables}
 
     def most_common_size(self) -> int:
         """Return most common array size > 1"""
-        array_sizes = [
-            self.datasets[address][1]
-            for name, address in self.arrays.items()
-            if self.datasets[address][1] > 1
-        ]
+        array_sizes = [size for name, path in self.arrays.items() if (size := self.datasets[path].size) > 1]
         return max(set(array_sizes), key=array_sizes.count)
 
     def most_common_shape(self) -> tuple:
         """Return most common non-singular array shape"""
-        array_shapes = [
-            self.datasets[address][2]
-            for name, address in self.arrays.items()
-            if len(self.datasets[address][2]) > 0
-        ]
+        array_shapes = [shape for name, path in self.arrays.items() if len(shape := self.datasets[path].shape) > 0]
         return max(set(array_shapes), key=array_shapes.count)
 
     def scannables_length(self) -> int:
         if not self.scannables:
             return 0
-        address = next(iter(self.scannables.values()))
-        shape = self.datasets[address][2]
+        path = next(iter(self.scannables.values()))
+        shape = self.datasets[path].shape
         return shape[0]
 
     def generate_scannables(self, array_size):
         """Populate self.scannables field with datasets size that match array_size"""
-        self.scannables = {k: v for k, v in self.arrays.items() if self.datasets[v][1] == array_size}
+        self.scannables = {k: v for k, v in self.arrays.items() if self.datasets[v].size == array_size}
         # create combined dict, scannables and arrays overwrite values with same name
         self.generate_combined()
 
-    def generate_scannables_from_group(self, hdf_group: h5py.Group, group_address: str = None):
+    def generate_scannables_from_group(self, hdf_group: h5py.Group, group_path: str = None):
         """
         Generate scannables list from a specific group, using the first item to define array size
         :param hdf_group: h5py.Group
-        :param group_address: str address of group hdf_group if hdf_group.name is incorrect
+        :param group_path: str path of group hdf_group if hdf_group.name is incorrect
         """
-        first_dataset = hdf_group[next(iter(hdf_group.keys()))]
+        first_dataset = hdf_group[next(iter(hdf_group))]
         array_size = first_dataset.size
         # watch out - hdf_group.name may not point to a location in the file!
-        address = hdf_group.name if group_address is None else group_address
-        self._populate(hdf_group, top_address=address, recursive=False)
+        hdf_path = hdf_group.name if group_path is None else group_path
+        self._populate(hdf_group, root=hdf_path, recursive=False)
         self.scannables = {
-            k: build_address(address, k)
+            k: build_hdf_path(hdf_path, k)
             for k in hdf_group if isinstance(hdf_group[k], h5py.Dataset) and hdf_group[k].size == array_size
         }
+        logger.debug(f"Scannables from group: {list(self.scannables.keys())}")
         self.generate_combined()
 
     def generate_scannables_from_names(self, names: list[str]):
         """Generate scannables list from a set of dataset names, using the first item to define array size"""
-        # concert names or addresses to name (to match altname)
-        array_names = [address2name(name) for name in names if address2name(name) in self.arrays]
-        if self._debug:
-            self._debug_logger(f"Scannables from names: {array_names}")
-        array_size = self.datasets[self.arrays[array_names[0]]][1]
+        # concert names or paths to name (to match alt_name)
+        array_names = [n for name in names if (n := generate_identifier(name)) in self.arrays]
+        logger.debug(f"Scannables from names: {array_names}")
+        array_size = self.datasets[self.arrays[array_names[0]]].size
         self.scannables = {
-            name: self.arrays[name] for name in array_names if self.datasets[self.arrays[name]][1] == array_size
+            name: self.arrays[name] for name in array_names if self.datasets[self.arrays[name]].size == array_size
         }
         self.generate_combined()
 
-    def _get_dataset(self, name_or_address: str, idx: int):
-        """Return attribute of dataset"""
-        if name_or_address in self.datasets:
-            return self.datasets[name_or_address][idx]
-        if name_or_address in self.combined:
-            return self.datasets[self.combined[name_or_address]][idx]
+    def get_path(self, name_or_path):
+        """Return hdf path of object in HdfMap"""
+        if name_or_path in self.datasets or name_or_path in self.groups:
+            return name_or_path
+        if name_or_path in self.combined:
+            return self.combined[name_or_path]
+        if name_or_path in self.image_data:
+            return self.image_data[name_or_path]
+        if name_or_path in self.classes:
+            return self.classes[name_or_path][0]  # return first path in list
 
-    def get_address(self, name_or_address):
-        """Return address of object in HdfMap"""
-        if name_or_address in self.datasets or name_or_address in self.groups:
-            return name_or_address
-        if name_or_address in self.combined:
-            return self.combined[name_or_address]
-        if name_or_address in self.image_data:
-            return self.image_data[name_or_address]
-        if name_or_address in self.classes:
-            return self.classes[name_or_address][0]
+    def get_group_path(self, name_or_path):
+        """Return group path of object in HdfMap"""
+        hdf_path = self.get_path(name_or_path)
+        while hdf_path and hdf_path not in self.groups:
+            hdf_path = SEP.join(hdf_path.split(SEP)[:-1])
+        if not hdf_path:
+            return SEP
+        return hdf_path
 
-    def get_group_address(self, name_or_address):
-        """Return group address of object in HdfMap"""
-        address = self.get_address(name_or_address)
-        while address and address not in self.groups:
-            address = SEP.join(address.split(SEP)[:-1])
-        return address
-
-    def find(self, name: str, name_only=True) -> list[str]:
+    def find_paths(self, string: str, name_only=True) -> list[str]:
         """
-        Search for name in addresses, return list of hdf addresses
-        :param name: str to find in list of datasets
-        :param name_only: if True, search only the name of the dataset, not the full address
-        :return: list of hdf addresses
+        Find any dataset paths that contain the given string argument
+        :param string: str to find in list of datasets
+        :param name_only: if True, search only the name of the dataset, not the full path
+        :return: list of hdf paths
         """
+        # find string in combined
+        combined_paths = [path for name, path in self.combined.items() if string in name]
         if name_only:
             return [
-                address for address, (dataset_name, size, shape, attrs) in self.datasets.items()
-                if name in dataset_name
-            ]
-        return [address for address in self.datasets if name in address]
+                path for path, dataset in self.datasets.items()
+                if string in dataset.name and path not in combined_paths
+            ] + combined_paths
+        return [
+            path for path in self.datasets if string in path and path not in combined_paths
+        ] + combined_paths
+
+    def find_names(self, string: str) -> list[str]:
+        """
+        Find any dataset names that contain the given string argument, searching names in self.combined
+        :param string: str to find in list of datasets
+        :return: list of names
+        """
+        return [name for name in self.combined if string in name]
 
     def find_attr(self, attr_name: str) -> list[str]:
         """
-        Search for hdf objects with a particular attribute (checks datasets and groups for obj.attr[name])
+        Find any dataset or group path with an attribute that contains attr_name.
         :param attr_name: str name of hdfobj.attr
-        :return: list of hdf addresses
+        :return: list of hdf paths
         """
         return [
-            address for address, (_, _, _, attr) in self.datasets.items() if attr_name in attr
+            path for path, (_, _, _, attr) in self.datasets.items() if attr_name in attr
         ] + [
-            address for address, (_, _, attr, _) in self.groups.items() if attr_name in attr
+            path for path, (_, _, attr, _) in self.groups.items() if attr_name in attr
         ]
 
-    def get_size(self, name_or_address: str) -> int:
-        """Return size of dataset"""
-        return self._get_dataset(name_or_address, 1)
-
-    def get_shape(self, name_or_address: str) -> tuple:
-        """Return shape of dataset"""
-        return self._get_dataset(name_or_address, 2)
-
-    def get_attrs(self, name_or_address: str) -> dict:
+    def get_attrs(self, name_or_path: str) -> dict:
         """Return attributes of dataset or group"""
-        if name_or_address in self.datasets:
-            return self.datasets[name_or_address][3]
-        if name_or_address in self.groups:
-            return self.groups[name_or_address][2]
-        if name_or_address in self.combined:
-            return self.datasets[self.combined[name_or_address]][3]
-        if name_or_address in self.classes:
-            return self.groups[self.classes[name_or_address][0]][2]
+        if name_or_path in self.datasets:
+            return self.datasets[name_or_path].attrs
+        if name_or_path in self.groups:
+            return self.groups[name_or_path].attrs
+        if name_or_path in self.combined:
+            return self.datasets[self.combined[name_or_path]].attrs
+        if name_or_path in self.classes:
+            return self.groups[self.classes[name_or_path][0]].attrs
 
-    def get_attr(self, name_or_address: str, attr_label: str, default: str | typing.Any = '') -> str:
+    def get_attr(self, name_or_path: str, attr_label: str, default: str | typing.Any = '') -> str:
         """Return named attribute from dataset or group, or default"""
-        attrs = self.get_attrs(name_or_address)
-        if attr_label in attrs:
-            return attrs[attr_label]
+        attrs = self.get_attrs(name_or_path)
+        if attrs and attr_label in attrs:
+            return attr.decode() if hasattr(attr := attrs[attr_label], 'decode') else attr
         return default
 
-    def set_image_address(self, name_or_address: str):
-        """Set the default image address, used by get_image"""
-        if name_or_address is None:
-            self._default_image_address = None
+    def set_image_path(self, name_or_path: str):
+        """Set the default image path, used by get_image"""
+        if name_or_path is None:
+            self._default_image_path = None
         else:
-            address = self.get_address(name_or_address)
-            if address:
-                self._default_image_address = address
-        if self._debug:
-            self._debug_logger(f"Default image address: {self._default_image_address}")
+            path = self.get_path(name_or_path)
+            if path:
+                self._default_image_path = path
+        logger.info(f"Default image path: {self._default_image_path}")
 
-    def get_image_address(self) -> str:
-        """Return HDF address of first dataset in self.image_data"""
-        if self._default_image_address:
-            return self._default_image_address
+    def get_image_path(self) -> str | None:
+        """Return HDF path of first dataset in self.image_data"""
+        if self._default_image_path:
+            return self._default_image_path
         if self.image_data:
             return next(iter(self.image_data.values()))
 
-    def get_group_datasets(self, name_or_address: str) -> list[str]:
-        """Find the address associate with the given name and return all datasets in that group"""
-        group_address = self.get_group_address(name_or_address)
-        if group_address:
-            return self.groups[group_address][3]
+    def get_group_datasets(self, name_or_path: str) -> list[str] | None:
+        """Find the path associate with the given name and return all datasets in that group"""
+        group_path = self.get_group_path(name_or_path)
+        if group_path:
+            return self.groups[group_path].datasets
 
     "--------------------------------------------------------"
     "---------------------- FILE READERS --------------------"
     "--------------------------------------------------------"
 
-    def get_data(self, hdf_file: h5py.File, name_or_address: str, index=(), default=None):
-        """Return data from dataset in file"""
-        address = self.get_address(name_or_address)
-        if address and address in hdf_file:
-            return hdf_file[address][index]
+    def get_data(self, hdf_file: h5py.File, name_or_path: str, index=(), default=None, direct_load=False):
+        """
+        Return data from dataset in file, converted into either datetime, str or squeezed numpy.array objects
+        See hdfmap.eval_functions.dataset2data for more information.
+        :param hdf_file: hdf file object
+        :param name_or_path: str name or path pointing to dataset in hdf file
+        :param index: index or slice of data in hdf file
+        :param default: value to return if name not found in hdf file
+        :param direct_load: return str, datetime or squeezed array if False, otherwise load data directly
+        :return: dataset2data(dataset) -> datetime, str or squeezed array as required.
+        """
+        path = self.get_path(name_or_path)
+        if path and path in hdf_file:
+            return dataset2data(hdf_file[path], index, direct_load)
         return default
 
-    def get_metadata(self, hdf_file: h5py.File, default=None) -> dict:
+    def get_metadata(self, hdf_file: h5py.File, default=None, direct_load=False) -> dict:
         """Return metadata from file (values associated with hdfmap.values)"""
         extra = extra_hdf_data(hdf_file)
         metadata = {
-            name: hdf_file[address][()] if address in hdf_file else default
-            for name, address in self.values.items()
+            name: dataset2data(hdf_file[path], direct_load=direct_load) if path in hdf_file else default
+            for name, path in self.values.items()
         }
         return {**extra, **metadata}
 
     def get_scannables(self, hdf_file: h5py.File) -> dict:
         """Return scannables from file (values associated with hdfmap.scannables)"""
         return {
-            name: hdf_file[address][()] for name, address in self.scannables.items()
-            if address in hdf_file
+            name: hdf_file[path][()] for name, path in self.scannables.items()
+            if path in hdf_file
         }
 
     def get_image(self, hdf_file: h5py.File, index: slice = None) -> np.ndarray:
         """
-        Get image data from file, using default image address
+        Get image data from file, using default image path
         :param hdf_file: hdf file object
         :param index: (slice,) or None to take the middle image
         :return: numpy array of image
         """
         if index is None:
             index = self.scannables_length() // 2
-        image_address = self.get_image_address()
-        if self._debug:
-            self._debug_logger(f"image address: {image_address}")
-        if image_address and image_address in hdf_file:
-            return hdf_file[image_address][index].squeeze()  # remove trailing dimensions
+        image_path = self.get_image_path()
+        logger.debug(f"image path: {image_path}")
+        if image_path and image_path in hdf_file:
+            return hdf_file[image_path][index].squeeze()  # remove trailing dimensions
 
     def _get_numeric_scannables(self, hdf_file: h5py.File) -> list[tuple[str, str]]:
         """Return numeric scannables available in file"""
         return [
-            (name, address) for name, address in self.scannables.items()
-            if hdf_file.get(address) and np.issubdtype(hdf_file.get(address).dtype, np.number)
+            (name, path) for name, path in self.scannables.items()
+            if hdf_file.get(path) and np.issubdtype(hdf_file.get(path).dtype, np.number)
         ]
 
     def get_scannables_array(self, hdf_file: h5py.File) -> np.ndarray:
         """Return 2D array of all scannables in file"""
         _scannables = self._get_numeric_scannables(hdf_file)
         dtypes = np.dtype([
-            (name, hdf_file[address].dtype) for name, address in _scannables
+            (name, hdf_file[path].dtype) for name, path in _scannables
         ])
-        return np.array([hdf_file.get(address)[()] for name, address in _scannables], dtype=dtypes)
+        return np.array([hdf_file.get(path)[()] for name, path in _scannables], dtype=dtypes)
 
-    def get_scannables_str(self, hdf_file: h5py.File, delimiter=', ',
-                           string_spec='', format_spec='f', default_decimals=8) -> str:
+    def create_scannables_table(self, hdf_file: h5py.File, delimiter=', ',
+                                string_spec='', format_spec='f', default_decimals=8) -> str:
         """
         Return str representation of scannables as a table
         The table starts with a header row given by names of the scannables.
@@ -543,36 +572,37 @@ class HdfMap:
         _scannables = self._get_numeric_scannables(hdf_file)
         fmt = string_spec + '.%d' + format_spec
         formats = [
-            '{:' + fmt % self.get_attr(address, 'decimals', default=default_decimals) + '}'
-            for name, address in _scannables
+            '{:' + fmt % self.get_attr(path, 'decimals', default=default_decimals) + '}'
+            for name, path in _scannables
         ]
 
         length = self.scannables_length()
         out = delimiter.join([name for name, _ in _scannables]) + '\n'
         out += '\n'.join([
             delimiter.join([
-                fmt.format(hdf_file.get(address)[n])
-                for (_, address), fmt in zip(_scannables, formats)
+                fmt.format(hdf_file.get(path)[n])
+                for (_, path), fmt in zip(_scannables, formats)
             ])
             for n in range(length)
         ])
         return out
 
-    def get_data_block(self, hdf_file: h5py.File) -> _DictObj:
+    def get_dataholder(self, hdf_file: h5py.File) -> DataHolder:
         """
-        Return data object
-            data_object.scannable -> array
-            data_object.metadata.value -> metadata
-            data_object['scannable'] -> array
-            data_object.metadata['value'] -> metadata
+        Return DataHolder object - a simple replication of scisoftpy.dictutils.DataHolder
+        Also known as DLS dat format.
+            dataholder.scannable -> array
+            dataholder.metadata.value -> metadata
+            dataholder['scannable'] -> array
+            dataholder.metadata['value'] -> metadata
         :param hdf_file: h5py.File object
         :return: data_object (similar to dict)
         """
         doc = f"""DataObject for '{hdf_file.filename}'"""
         metadata = self.get_metadata(hdf_file)
         scannables = self.get_scannables(hdf_file)
-        scannables['metadata'] = _DictObj(metadata, docstr=doc)
-        return _DictObj(scannables, docstr=doc)
+        scannables['metadata'] = DataHolder(metadata, docstr=doc)
+        return DataHolder(scannables, docstr=doc)
 
     def eval(self, hdf_file: h5py.File, expression: str):
         """
@@ -581,7 +611,7 @@ class HdfMap:
         :param expression: str expression to be evaluated
         :return: eval(expression)
         """
-        return eval_hdf(hdf_file, expression, self.combined, self._debug)
+        return eval_hdf(hdf_file, expression, self.combined)
 
     def format_hdf(self, hdf_file: h5py.File, expression: str) -> str:
         """
@@ -590,4 +620,17 @@ class HdfMap:
         :param expression: str expression using {name} format specifiers
         :return: eval_hdf(f"expression")
         """
-        return format_hdf(hdf_file, expression, self.combined, self._debug)
+        return format_hdf(hdf_file, expression, self.combined)
+
+    def info_data(self, hdf_file):
+        """Return string showing metadata values associated with names"""
+        out = repr(self) + '\n'
+        out = "Combined Namespace:\n"
+        out += '\n'.join([
+            f"{name:>30}: " +
+            f"{str(data if np.size(data := dataset2data(hdf_file[path])) <= 1 else self.datasets[path].shape):20}" +
+            f": {path:60}"
+            for name, path in self.combined.items()
+        ])
+        out += f"\n{self.info_scannables()}"
+        return out

@@ -12,19 +12,19 @@ with load_hdf('file.nxs') as nxs:
     string = hmap.format_hdf(nxs, "the energy is {energy:.2f} keV")
     d = hmap.get_data_block(nxs)  # classic data table, d.scannable, d.metadata
 
-# Shortcuts - single file reloader class
-from hdfmap import HdfReloader
-hdf = HdfReloader('file.hdf')
-[data1, data2] = hdf.get_data(['dataset_name_1', 'dataset_name_2'])
-data = hdf.eval('dataset_name_1 * 100 + 2')
-string = hdf.format('my data is {dataset_name_1:.2f}')
+# Shortcuts - single file reloading class
+from hdfmap import NexusLoader
+scan = NexusLoader('file.nxs')
+[data1, data2] = scan.get_data(['dataset_name_1', 'dataset_name_2'])
+data = scan.eval('dataset_name_1 * 100 + 2')
+string = scan.format('my data is {dataset_name_1:.2f}')
 
 # Shortcuts - multifile load data
 from hdfmap import hdf_data, hdf_eval, hdf_format, hdf_image
-all_data = hdf_data([f'file{n}.nxs' for n in range(100)], 'dataset_name')
+all_data = hdf_data([f"file{n}.nxs" for n in range(100)], 'dataset_name')
 normalised_data = hdf_eval(filenames, 'total / Transmission / (rc / 300.)')
 descriptions = hdf_eval(filenames, 'Energy: {en:5.3f} keV')
-image_stack = hdf_image(filenames, index=31)
+image = hdf_image(filenames, index=31)
 
 
 By Dr Dan Porter
@@ -32,16 +32,22 @@ Diamond Light Source Ltd
 2024
 """
 
-
+from .logging import set_logging_levels
 from .hdfmap_class import HdfMap
 from .nexus import NexusMap
 from .file_functions import list_files, load_hdf, create_hdf_map, create_nexus_map
 from .file_functions import hdf_data, hdf_image, hdf_eval, hdf_format, nexus_data_block
-from .reloader_class import HdfReloader
+from .reloader_class import HdfLoader, NexusLoader
 
 
-__version__ = "0.3.0"
-__date__ = "2024/07/10"
+__all__ = [
+    HdfMap, NexusMap, load_hdf, create_hdf_map, create_nexus_map,
+    hdf_data, hdf_image, hdf_eval, hdf_format, nexus_data_block, HdfLoader, NexusLoader,
+    set_logging_levels
+]
+
+__version__ = "0.5.0"
+__date__ = "2024/08/02"
 
 
 def version_info() -> str:

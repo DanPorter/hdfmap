@@ -7,8 +7,9 @@ import os
 import json
 import hdfmap
 
-DIR = '/dls/science/groups/das/ExampleData/hdfmap_tests/'
+
 DATA_LOCATION = os.path.dirname(__file__) + '/data/test_files.json'
+DIR = '/dls/science/groups/das/ExampleData/hdfmap_tests/'
 FILES = [
     (DIR + 'i16/1040311.nxs', 'i16 pilatus eta scan, old nexus format'),
     (DIR + 'i16/1040323.nxs', 'i16 pilatus hkl scan, new nexus format'),
@@ -31,10 +32,10 @@ def check_nexus(filename, description):
         'len_combined': len(mymap.combined),
         'len_scannables': len(mymap.scannables),
         'scannables_length': mymap.scannables_length(),
-        'scan_command': mymap['scan_command'],
-        'axes': mymap['axes'],
-        'signal': mymap['signal'],
-        'image': mymap.get_image_address()
+        'scan_command': mymap.get_path('scan_command'),
+        'axes': mymap.get_path('axes'),
+        'signal': mymap.get_path('signal'),
+        'image': mymap.get_image_path()
     }
     return out
 

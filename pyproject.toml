@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools >= 61.0", "wheel", "numpy", "h5py", "hdf5plugin"]
+requires = ["setuptools >= 61.0", "wheel", "pytest", "numpy", "h5py", "hdf5plugin"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "hdfmap"
-version = "0.3"
+version = "0.4"
 dependencies = [
   "numpy",
   "h5py",
@@ -39,3 +39,7 @@ Repository = "https://github.com/DanPorter/hdfmap"
 Changelog = "https://github.com/DanPorter/hdfmap/blob/master/README.md"
 
 
+[tool.pytest.ini_options]
+pythonpath = [
+  "src",
+]
